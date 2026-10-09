@@ -23,7 +23,16 @@ The workflow is executed via a unified Bash shell script (`wes_pipeline.sh`) div
    - `avsnp150` (dbSNP identifiers)
 6. **Clinical IEI Filtering:** The heavily annotated variant list is cross-referenced against a custom, curated Inborn Errors of Immunity gene panel (`clean_iuis_panel.txt`). Variants outside this panel are filtered out, resulting in a clinically actionable candidate list.
 
+### Phase 3: Downstream Analysis & Visualization (R/RMarkdown)
+7. **Automated Reporting (`master_report.Rmd`):** A comprehensive R script processes the annotated outputs to perform:
+   - **Genotype Quality Control:** Evaluates read depth (DP) and allele fractions (AF) directly from the VCF.
+   - **Constraint Metrics Integration:** Maps candidate genes against gnomAD constraint metrics (pLI vs LOEUF) to assess Loss-of-Function intolerance.
+   - **Data Visualization:** Generates Nature-style, publication-ready composite figures (SVG/PDF/TIFF) detailing functional categories, allele frequencies, chromosome distributions, and sequential filtering waterfalls.
+   - **Final Prioritization:** Outputs a dynamically generated PDF report and a final consolidated CSV table mapping variants to specific IEI inheritance patterns.
+
 ## Environment & Dependencies
+
+### 1. HPC Environment (Phase 1 & 2)
 This script is designed for a Linux-based HPC cluster running the SLURM scheduler. 
 * **Environment Manager:** Conda 
 * **Core Bioinformatics Tools Required:**
@@ -32,6 +41,11 @@ This script is designed for a Linux-based HPC cluster running the SLURM schedule
   * GATK4 (Genome Analysis Toolkit)
   * ANNOVAR
   * Perl, Bash, and standard UNIX utilities (`grep`, `head`)
+
+### 2. R Environment (Phase 3)
+* **Language:** R (v4.2+)
+* **Core Packages:** `tidyverse`, `vcfR`, `ggplot2`, `patchwork`, `ggrepel`, `kableExtra`
+* **Graphics Engines:** `svglite`, `ragg`, `showtext`
 
 ## Usage
 
@@ -44,3 +58,6 @@ Verify that your IEI gene panel (`clean_iuis_panel.txt`) and raw FASTQ files (`S
 Submit the batch script to the SLURM scheduler:
 ```bash
 sbatch wes_pipeline.sh
+
+### 3. Visualization 
+rmarkdown::render("R_Analysis&Visualization.Rmd", params = list(sample_id = "SAMPLE_1"))
