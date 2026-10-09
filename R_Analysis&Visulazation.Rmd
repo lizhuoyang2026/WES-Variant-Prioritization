@@ -1,0 +1,1101 @@
+---
+title: "Whole Exome Sequencing Analysis Report"
+subtitle: "SNV and INDEL Variant Prioritisation in IEI Candidate Genes"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+editor_options:
+  chunk_output_type: inline
+params:
+  sample_id: "SAMPLE_1"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, comment = "")
+
+library(tidyverse)
+library(knitr)
+library(readxl)
+library(vcfR)
+library(kableExtra)
+library(patchwork)
+library(ggrepel)
+library(svglite)
+library(ragg)
+library(showtext)
+showtext_auto()
+
+# ============================================================================
+# NATURE-STYLE THEME (unified across all figures)
+# ============================================================================
+nature_theme <- theme_classic(base_size = 7, base_family = "Arial") +
+  theme(
+    axis.line        = element_line(linewidth = 0.35, colour = "black"),
+    axis.ticks       = element_line(linewidth = 0.35, colour = "black"),
+    axis.text        = element_text(size = 6.5, colour = "black"),
+    axis.title       = element_text(size = 7),
+    legend.title     = element_text(size = 6.5),
+    legend.text      = element_text(size = 6),
+    legend.position  = "bottom",
+    legend.key.size  = unit(3, "mm"),
+    strip.text       = element_text(size = 7, face = "bold"),
+    plot.title       = element_text(size = 8, face = "bold", hjust = 0.5,
+                                    margin = margin(b = 4)),
+    plot.subtitle    = element_text(size = 6.5, hjust = 0.5,
+                                    margin = margin(b = 3)),
+    plot.margin      = margin(4, 4, 2, 2),
+    panel.grid       = element_blank(),
+    panel.border     = element_blank()
+  )
+
+# Unified colour palette (low-saturation, Nature-compatible)
+pal_primary   <- "#4472C4"   # blue — main data
+pal_secondary <- "#8B6CAD"   # purple — secondary categories
+pal_accent    <- "#ED7D31"   # orange — highlights / damaging variants
+pal_pass      <- "#4D9E5D"   # green — QC PASS
+pal_fail      <- "#D64545"   # red — QC FAIL
+pal_neutral   <- "#9E9E9E"   # grey — reference lines
+pal_bg        <- "#F5F5F5"   # light grey — background elements
+
+# ============================================================================
+# PUBLICATION FIGURE EXPORT
+# ============================================================================
+save_pub_r <- function(plot, filename, width_mm = 120, height_mm = 85, dpi = 600) {
+  w <- width_mm / 25.4
+  h <- height_mm / 25.4
+  svglite::svglite(paste0(filename, ".svg"), width = w, height = h,
+                   bg = "white", fix_text_size = FALSE)
+  print(plot)
+  dev.off()
+  grDevices::cairo_pdf(paste0(filename, ".pdf"), width = w, height = h,
+                       family = "Arial", bg = "white")
+  print(plot)
+  dev.off()
+  ragg::agg_tiff(paste0(filename, ".tiff"), width = w, height = h,
+                 units = "in", res = dpi, bg = "white")
+  print(plot)
+  dev.off()
+}
+
+# ============================================================================
+# PATHS (parameterised by sample_id)
+# ============================================================================
+sample_id <- params$sample_id
+sample_id_display <- gsub("_", "\\\\_", sample_id)  # escape underscore for LaTeX
+input_dir <- "/path/to/your/R_analysis/directory"
+out_dir   <- file.path(input_dir, "Marvis_output")
+fig_dir   <- file.path(input_dir, "Figures", sample_id)
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+snp_csv    <- file.path(input_dir, paste0(sample_id, "_snp.hg38_multianno.csv"))
+indel_csv  <- file.path(input_dir, paste0(sample_id, "_indel.hg38_multianno.csv"))
+snp_vcf    <- file.path(input_dir, paste0(sample_id, "_snp.vcf"))
+iei_file   <- file.path(input_dir, "IUIS-IEI-list-for-web-site-July-2024V2.xlsx")
+const_file <- file.path(input_dir, "gnomad.v4.1.constraint_metrics.tsv")
+```
+
+\newpage
+
+# Data Loading and Preprocessing
+
+```{r load-data}
+snp_multianno   <- readr::read_csv(snp_csv, col_names = TRUE, comment = "#",
+                                    show_col_types = FALSE)
+indel_multianno <- readr::read_csv(indel_csv, col_names = TRUE, comment = "#",
+                                    show_col_types = FALSE)
+
+# Load IEI gene panel
+iei_data  <- read_excel(iei_file, sheet = 1)
+iei_genes <- na.omit(unique(as.character(iei_data[["Genetic defect"]])))
+
+# Build IEI inheritance lookup: Gene -> Inheritance (keep first match per gene)
+# NOTE: distinct(.keep_all = FALSE) drops all non-grouping cols — use TRUE instead
+iei_inheritance <- iei_data %>%
+  rename(Gene = `Genetic defect`) %>%
+  filter(!is.na(Gene), !is.na(Inheritance)) %>%
+  mutate(Gene = str_trim(as.character(Gene)),
+         Inheritance = str_trim(as.character(Inheritance))) %>%
+  select(Gene, Inheritance) %>%
+  distinct(Gene, .keep_all = TRUE)
+
+# Load gnomAD constraint metrics (canonical transcripts only)
+constraint_data <- read_tsv(const_file, comment = "#", show_col_types = FALSE)
+constraint_lookup <- constraint_data %>%
+  filter(canonical == TRUE | canonical == "true") %>%
+  select(gene, lof.pLI, lof.oe_ci.upper) %>%
+  rename(Gene = gene, pLI = lof.pLI, LOEUF = lof.oe_ci.upper) %>%
+  distinct(Gene, .keep_all = TRUE)
+
+if (nrow(constraint_lookup) == 0) {
+  constraint_lookup <- constraint_data %>%
+    select(gene, lof.pLI, lof.oe_ci.upper) %>%
+    rename(Gene = gene, pLI = lof.pLI, LOEUF = lof.oe_ci.upper) %>%
+    distinct(Gene, .keep_all = TRUE)
+}
+
+cat(sprintf("Sample: %s | IEI genes: %d | Constraint genes: %d\n",
+            sample_id, length(iei_genes), nrow(constraint_lookup)))
+```
+
+\newpage
+
+# Coverage Overview
+
+```{r coverage-overview, fig.height=3.5, fig.width=7}
+# ---- Helper: covered genes and transcripts ----
+get_covered_genes <- function(df) {
+  df %>%
+    filter(Func.refGene %in% c("exonic", "exonic;splicing", "splicing")) %>%
+    filter(grepl("NM_", AAChange.refGene)) %>%
+    separate_rows(Gene.refGene, sep = ",") %>%
+    filter(!grepl("NONE", Gene.refGene)) %>%
+    mutate(Gene = str_trim(Gene.refGene)) %>%
+    filter(nchar(Gene) > 0, Gene != ".") %>%
+    pull(Gene) %>% unique()
+}
+
+get_covered_transcripts <- function(df) {
+  df %>%
+    filter(Func.refGene %in% c("exonic", "exonic;splicing", "splicing")) %>%
+    filter(grepl("NM_", AAChange.refGene)) %>%
+    pull(AAChange.refGene) %>% str_split(",") %>% unlist() %>%
+    str_extract("NM_[0-9]+\\.?[0-9]*") %>% na.omit() %>% unique()
+}
+
+snp_genes         <- get_covered_genes(snp_multianno)
+indel_genes       <- get_covered_genes(indel_multianno)
+snp_transcripts   <- get_covered_transcripts(snp_multianno)
+indel_transcripts <- get_covered_transcripts(indel_multianno)
+all_genes         <- union(snp_genes, indel_genes)
+all_transcripts   <- union(snp_transcripts, indel_transcripts)
+total_human_pcg   <- 20076
+pct_covered <- round(length(all_genes) / total_human_pcg * 100, 2)
+
+# ---- Coverage summary table ----
+coverage_summary <- tibble(
+  Metric = c(
+    "Unique genes (SNV)", "Unique genes (INDEL)", "Unique genes (combined)",
+    "Unique transcripts (SNV)", "Unique transcripts (INDEL)", "Unique transcripts (combined)",
+    "Human protein-coding genes (RefSeq hg38)", "% Human protein-coding genes detected"
+  ),
+  Value = c(
+    length(snp_genes), length(indel_genes), length(all_genes),
+    length(snp_transcripts), length(indel_transcripts), length(all_transcripts),
+    total_human_pcg, paste0(pct_covered, "%")
+  )
+)
+
+knitr::kable(coverage_summary,
+  caption = "Gene and Transcript Coverage Summary (exonic/splicing variants)",
+  align = c("l", "r"), booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position")
+
+# ---- Fig 1: Coverage bar ----
+coverage_plot_df <- tibble(
+  Category = factor(c("SNV genes", "INDEL genes", "Combined genes",
+                       "SNV transcripts", "INDEL transcripts", "Combined transcripts"),
+    levels = c("SNV genes", "INDEL genes", "Combined genes",
+               "SNV transcripts", "INDEL transcripts", "Combined transcripts")),
+  Type  = c(rep("Genes", 3), rep("Transcripts", 3)),
+  Count = c(length(snp_genes), length(indel_genes), length(all_genes),
+            length(snp_transcripts), length(indel_transcripts), length(all_transcripts))
+)
+
+p_coverage <- ggplot(coverage_plot_df, aes(x = Category, y = Count, fill = Type)) +
+  geom_col(width = 0.65, colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = scales::comma(Count)), vjust = -0.4, size = 2.2) +
+  scale_fill_manual(values = c("Genes" = pal_primary, "Transcripts" = pal_secondary)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12)), labels = scales::comma) +
+  labs(title = "WES Coverage Overview",
+       subtitle = paste0(sample_id_display, " — ", pct_covered, "% of human protein-coding genes detected"),
+       x = NULL, y = "Count", fill = NULL) +
+  nature_theme + theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 6))
+
+p_coverage
+save_pub_r(p_coverage, file.path(fig_dir, paste0(sample_id, "_Fig1_coverage")), 140, 85)
+
+# ---- SNV vs INDEL gene overlap ----
+snv_only  <- length(setdiff(snp_genes, indel_genes))
+indel_only <- length(setdiff(indel_genes, snp_genes))
+both <- length(intersect(snp_genes, indel_genes))
+
+overlap_df <- tibble(
+  Category = c("SNV only", "Both", "INDEL only"),
+  Count = c(snv_only, both, indel_only)
+)
+
+p_overlap <- ggplot(overlap_df, aes(x = factor(Category,
+      levels = c("SNV only", "Both", "INDEL only")), y = Count, fill = Category)) +
+  geom_col(width = 0.55, colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = Count), vjust = -0.4, size = 2.5) +
+  scale_fill_manual(values = c("SNV only" = pal_primary,
+                                "Both" = pal_accent,
+                                "INDEL only" = pal_secondary)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Gene Overlap: SNV vs INDEL",
+       subtitle = paste("Shared:", both, "genes"),
+       x = NULL, y = "Number of genes") +
+  nature_theme + theme(legend.position = "none")
+
+p_overlap
+save_pub_r(p_overlap, file.path(fig_dir, paste0(sample_id, "_Fig2_overlap")), 85, 75)
+```
+
+\newpage
+
+# Functional Annotation Summary
+
+## SNV Functional Annotations
+
+```{r snv-functional, fig.height=9, fig.width=7}
+# ---- (a) Functional category distribution ----
+func_counts_snp <- snp_multianno %>%
+  count(Func.refGene, sort = TRUE) %>%
+  rename(Function = Func.refGene, Count = n)
+
+p_func <- ggplot(func_counts_snp, aes(x = reorder(Function, Count), y = Count)) +
+  geom_col(fill = pal_primary, width = 0.7, colour = "white", linewidth = 0.2) +
+  geom_text(aes(label = Count), hjust = -0.2, size = 2.2) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12)), labels = scales::comma) +
+  labs(title = "SNV Functional Categories", x = NULL, y = "Count") +
+  nature_theme
+
+# ---- (b) Exonic variant types ----
+variant_summary_snp <- snp_multianno %>%
+  filter(Func.refGene %in% c("exonic", "exonic;splicing")) %>%
+  count(ExonicFunc.refGene) %>%
+  arrange(desc(n)) %>%
+  filter(ExonicFunc.refGene != "." & !is.na(ExonicFunc.refGene))
+
+p_vartype <- ggplot(variant_summary_snp,
+  aes(x = reorder(ExonicFunc.refGene, n), y = n)) +
+  geom_col(fill = pal_secondary, width = 0.7, colour = "white", linewidth = 0.2) +
+  geom_text(aes(label = n), hjust = -0.2, size = 2.2) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Exonic SNV Variant Types", x = NULL, y = "Count") +
+  nature_theme
+
+# ---- (c) Top genes by variant count ----
+top_genes_snp <- snp_multianno %>%
+  filter(!grepl("NONE", Gene.refGene), Gene.refGene != ".") %>%
+  count(Gene.refGene, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  rename(Gene = Gene.refGene, Count = n) %>%
+  mutate(Gene_label = str_trunc(Gene, 14))
+
+p_topgenes <- ggplot(top_genes_snp, aes(x = reorder(Gene_label, Count), y = Count)) +
+  geom_col(fill = pal_primary, width = 0.7, colour = "white", linewidth = 0.2) +
+  geom_text(aes(label = Count), hjust = -0.2, size = 2.2) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.14))) +
+  labs(title = "Top Genes with Most SNV Variants", x = NULL, y = "Count") +
+  nature_theme + theme(axis.text.y = element_text(size = 5.5))
+
+# ---- (d) Rare variant genes ----
+rare_variants_snp <- snp_multianno %>%
+  mutate(gnomad_af = suppressWarnings(as.numeric(na_if(gnomad41_exome_AF, ".")))) %>%
+  filter(!is.na(gnomad_af) & gnomad_af < 0.01) %>%
+  filter(!grepl("NONE", Gene.refGene), Gene.refGene != ".") %>%
+  count(Gene.refGene, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  rename(Gene = Gene.refGene, Count = n) %>%
+  mutate(Gene_label = str_trunc(Gene, 14))
+
+p_rare <- ggplot(rare_variants_snp, aes(x = reorder(Gene_label, Count), y = Count)) +
+  geom_col(fill = pal_accent, width = 0.7, colour = "white", linewidth = 0.2) +
+  geom_text(aes(label = Count), hjust = -0.2, size = 2.2) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Top Genes with Rare SNVs (gnomAD AF < 1%)",
+       x = NULL, y = "Count") +
+  nature_theme + theme(axis.text.y = element_text(size = 5.5))
+
+# ---- Assemble 4-panel layout ----
+p_snv_composite <- (p_func | p_vartype) / (p_topgenes | p_rare) +
+  plot_annotation(
+    title = paste0(sample_id_display, " — SNV Functional Annotation"),
+    tag_levels = "a"
+  ) & theme(plot.tag = element_text(size = 8, face = "bold"))
+
+p_snv_composite
+save_pub_r(p_snv_composite, file.path(fig_dir, paste0(sample_id, "_Fig3_SNV_annotation")), 183, 180)
+```
+
+\newpage
+
+## INDEL Functional Annotations
+
+```{r indel-functional, fig.height=9, fig.width=7}
+# ---- (a) Functional categories ----
+func_counts_indel <- indel_multianno %>%
+  count(Func.refGene, sort = TRUE) %>%
+  rename(Function = Func.refGene, Count = n)
+
+p_ifunc <- ggplot(func_counts_indel, aes(x = reorder(Function, Count), y = Count)) +
+  geom_col(fill = pal_secondary, width = 0.7, colour = "white", linewidth = 0.2) +
+  geom_text(aes(label = Count), hjust = -0.2, size = 2.2) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "INDEL Functional Categories", x = NULL, y = "Count") +
+  nature_theme
+
+# ---- (b) Allele frequency (guarded NA handling) ----
+indel_af <- indel_multianno %>%
+  mutate(gnomad_af = suppressWarnings(as.numeric(na_if(gnomad41_exome_AF, ".")))) %>%
+  filter(!is.na(gnomad_af))
+
+n_na_af <- sum(is.na(suppressWarnings(
+  as.numeric(na_if(indel_multianno[["gnomad41_exome_AF"]], ".")))))
+
+p_af <- ggplot(indel_af, aes(x = gnomad_af)) +
+  geom_histogram(bins = 50, fill = pal_secondary, colour = "white", linewidth = 0.15) +
+  geom_vline(xintercept = 0.01, linetype = "dashed", colour = pal_accent, linewidth = 0.5) +
+  annotate("text", x = 0.015, y = Inf, label = "AF = 1%", colour = pal_accent,
+           size = 2.2, hjust = 0, vjust = 2) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  labs(title = "INDEL Allele Frequency (gnomAD v4.1)",
+       subtitle = paste(n_na_af, "variants without gnomAD annotation (retained)"),
+       x = "Allele Frequency", y = "Count") +
+  nature_theme
+
+# ---- (c) Chromosome distribution (Nature-Optimized Fix) ----
+chr_counts_indel <- indel_multianno %>%
+  count(Chr, sort = TRUE) %>%
+  filter(str_detect(Chr, "^chr([1-9]|1[0-9]|2[0-2]|[XYM])$")) %>%
+  mutate(Chr = factor(Chr, levels = c(paste0("chr", 1:22), "chrX", "chrY", "chrM"))) %>%
+  filter(!is.na(Chr))
+
+p_chr <- ggplot(chr_counts_indel, aes(x = Chr, y = n)) +
+  geom_col(fill = pal_primary, width = 0.6, colour = "white", linewidth = 0.15) +
+  geom_text(aes(label = scales::comma(n)), vjust = -0.4, size = 2.5, fontface = "bold", color = "#333333") +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15)),
+    labels = scales::comma
+  ) +
+  labs(
+    title = "Chromosome Distribution of INDELs",
+    x = "Chromosome",
+    y = "Number of INDELs"
+  ) +
+  nature_theme +
+  theme(
+    axis.text.x = element_text(angle = 55, hjust = 1, size = 8, color = "#222222"),
+    axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+    plot.title = element_text(size = 8, face = "bold", hjust = 0.5, pad = 10)
+  )
+
+# ---- (d) Insertion vs Deletion ----
+indel_types <- indel_multianno %>%
+  mutate(IndelType = case_when(
+    nchar(Ref) < nchar(Alt) ~ "Insertion",
+    nchar(Ref) > nchar(Alt) ~ "Deletion",
+    TRUE ~ "Other"
+  )) %>%
+  count(IndelType, sort = TRUE) %>%
+  filter(IndelType != "Other")
+
+p_type <- ggplot(indel_types, aes(x = IndelType, y = n, fill = IndelType)) +
+  geom_col(width = 0.45, colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = n), vjust = -0.4, size = 2.5) +
+  scale_fill_manual(values = c("Insertion" = pal_accent, "Deletion" = pal_secondary)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "INDEL Types", x = NULL, y = "Count") +
+  nature_theme + theme(legend.position = "none")
+
+# ---- Assemble ----
+p_indel_composite <- (p_ifunc | p_af) / (p_chr | p_type) +
+  plot_annotation(
+    title = paste0(sample_id_display, " — INDEL Functional Annotation"),
+    tag_levels = "a"
+  ) & theme(plot.tag = element_text(size = 8, face = "bold"))
+
+p_indel_composite
+save_pub_r(p_indel_composite,
+  file.path(fig_dir, paste0(sample_id, "_Fig4_INDEL_annotation")), 183, 180)
+```
+
+\newpage
+
+# Reference Data
+
+```{r ref-data}
+cat(sprintf("**IEI Gene Panel:** %d genes loaded from IUIS 2024 list.\n\n",
+            length(iei_genes)))
+cat(sprintf("**gnomAD Constraint Metrics:** %d genes (canonical transcripts only).\n",
+            nrow(constraint_lookup)))
+```
+
+\newpage
+
+# Variant Filtering and Prioritisation
+
+## Filtering Strategy
+
+**SNV filters** (sequential):
+1. Exonic / exonic;splicing regions
+2. IEI candidate gene list
+3. Exclude synonymous SNVs
+4. gnomAD v4.1 exome AF < 1% (NA retained)
+5. In-silico: AlphaMissense (pathogenic/likely_pathogenic) | REVEL > 0.75 | CADD >= 20 | stopgain/stoploss/startloss
+6. Annotate pLI + LOEUF (not used for filtering)
+
+**INDEL filters** (sequential):
+1. Exonic / exonic;splicing / splicing regions
+2. IEI candidate gene list
+3. Non-synonymous / frameshift / stop-altering types
+4. gnomAD v4.1 exome AF < 1% (NA retained)
+5. Frameshift/stopgain = unconditional pass; nonframeshift requires CADD >= 15
+6. Annotate pLI + LOEUF
+
+```{r snv-filtering}
+pop_freq_threshold <- 0.01
+
+filter_log <- tibble(Stage = character(), Variants = integer())
+
+# ---- SNV Pipeline ----
+total_snvs <- nrow(snp_multianno)
+filter_log <- filter_log %>% add_row(Stage = "Total SNVs", Variants = total_snvs)
+
+exonic_snvs <- snp_multianno %>%
+  filter(Func.refGene %in% c("exonic", "exonic;splicing"))
+filter_log <- filter_log %>% add_row(Stage = "Exonic", Variants = nrow(exonic_snvs))
+
+iei_snvs <- exonic_snvs %>% filter(Gene.refGene %in% iei_genes)
+filter_log <- filter_log %>%
+  add_row(Stage = "In IEI genes", Variants = nrow(iei_snvs))
+
+nonsyn_snvs <- iei_snvs %>%
+  filter(ExonicFunc.refGene %in% c("nonsynonymous SNV", "stopgain", "stoploss",
+                                    "startloss", "unknown"))
+filter_log <- filter_log %>%
+  add_row(Stage = "Non-synonymous", Variants = nrow(nonsyn_snvs))
+
+rare_snvs <- nonsyn_snvs %>%
+  mutate(gnomad_af = suppressWarnings(as.numeric(na_if(gnomad41_exome_AF, ".")))) %>%
+  filter(is.na(gnomad_af) | gnomad_af < pop_freq_threshold)
+filter_log <- filter_log %>%
+  add_row(Stage = "gnomAD AF < 1%", Variants = nrow(rare_snvs))
+
+damaging_snvs <- rare_snvs %>%
+  mutate(
+    revel_score = suppressWarnings(as.numeric(na_if(REVEL_score, "."))),
+    cadd_score  = suppressWarnings(as.numeric(na_if(CADD_phred, ".")))
+  ) %>%
+  filter(
+    ExonicFunc.refGene %in% c("stopgain", "stoploss", "startloss") |
+      AlphaMissense_pred %in% c("pathogenic", "likely_pathogenic") |
+      (!is.na(revel_score) & revel_score > 0.75) |
+      (!is.na(cadd_score) & cadd_score >= 20)
+  )
+filter_log <- filter_log %>%
+  add_row(Stage = "Pathogenicity filter", Variants = nrow(damaging_snvs))
+
+final_variants <- damaging_snvs %>%
+  left_join(constraint_lookup, by = c("Gene.refGene" = "Gene"))
+filter_log <- filter_log %>%
+  add_row(Stage = "Final candidate SNVs", Variants = nrow(final_variants))
+
+write.csv(final_variants,
+  file.path(out_dir, paste0(sample_id, "_candidate_SNVs.csv")), row.names = FALSE)
+
+# ---- INDEL Pipeline ----
+indel_log <- tibble(Stage = character(), Variants = integer())
+
+total_indels <- nrow(indel_multianno)
+indel_log <- indel_log %>% add_row(Stage = "Total INDELs", Variants = total_indels)
+
+exonic_indels <- indel_multianno %>%
+  filter(Func.refGene %in% c("exonic", "exonic;splicing", "splicing"))
+indel_log <- indel_log %>%
+  add_row(Stage = "Exonic/splicing", Variants = nrow(exonic_indels))
+
+iei_indels <- exonic_indels %>% filter(Gene.refGene %in% iei_genes)
+indel_log <- indel_log %>%
+  add_row(Stage = "In IEI genes", Variants = nrow(iei_indels))
+
+indel_priority <- c("frameshift deletion", "frameshift insertion",
+  "nonframeshift deletion", "nonframeshift insertion",
+  "stopgain", "stoploss", "startloss", "unknown")
+nonsyn_indels <- iei_indels %>% filter(ExonicFunc.refGene %in% indel_priority)
+indel_log <- indel_log %>%
+  add_row(Stage = "Non-synonymous/fs", Variants = nrow(nonsyn_indels))
+
+rare_indels <- nonsyn_indels %>%
+  mutate(gnomad_af = suppressWarnings(as.numeric(na_if(gnomad41_exome_AF, ".")))) %>%
+  filter(is.na(gnomad_af) | gnomad_af < pop_freq_threshold)
+indel_log <- indel_log %>%
+  add_row(Stage = "gnomAD AF < 1%", Variants = nrow(rare_indels))
+
+frameshift_types <- c("frameshift deletion", "frameshift insertion",
+                       "stopgain", "stoploss", "startloss")
+
+damaging_indels <- rare_indels %>%
+  mutate(
+    cadd_score = suppressWarnings(as.numeric(na_if(CADD_phred, "."))),
+    is_damaging = case_when(
+      ExonicFunc.refGene %in% frameshift_types ~ TRUE,
+      ExonicFunc.refGene %in% c("nonframeshift deletion", "nonframeshift insertion") &
+        !is.na(cadd_score) & cadd_score >= 15 ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  filter(is_damaging)
+indel_log <- indel_log %>%
+  add_row(Stage = "Pathogenicity filter", Variants = nrow(damaging_indels))
+
+final_indels <- damaging_indels %>%
+  left_join(constraint_lookup, by = c("Gene.refGene" = "Gene"))
+indel_log <- indel_log %>%
+  add_row(Stage = "Final candidate INDELs", Variants = nrow(final_indels))
+
+write.csv(final_indels,
+  file.path(out_dir, paste0(sample_id, "_candidate_INDELs.csv")), row.names = FALSE)
+```
+
+
+```{r filtering-waterfall, fig.height=6, fig.width=9}
+# ---- Fig: SNV Filtering Waterfall ----
+
+filter_log <- filter_log %>%
+  mutate(
+    Stage = factor(Stage, levels = Stage),
+    label_col = ifelse(
+      Stage == "Final candidate SNVs",
+      pal_accent,
+      pal_primary
+    )
+  )
+
+p_snv_funnel <- ggplot(filter_log, aes(x = Stage, y = Variants)) +
+  geom_col(
+    aes(fill = label_col),
+    width = 0.65,
+    colour = "white",
+    linewidth = 0.3
+  ) +
+  geom_text(
+    aes(label = scales::comma(Variants)),
+    vjust = -0.4,
+    size = 2.8,
+    fontface = "bold"
+  ) +
+  scale_fill_identity() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15)),
+    labels = scales::comma
+  ) +
+  labs(
+    title = paste0(sample_id_display, " — SNV Filtering Cascade"),
+    subtitle = paste(
+      "Final:",
+      nrow(final_variants),
+      "candidate SNVs from",
+      scales::comma(total_snvs),
+      "input variants"
+    ),
+    x = "Filtering Stage",
+    y = "Number of Variants"
+  ) +
+  nature_theme +
+  theme(
+    axis.text.x = element_text(
+      angle = 30,
+      hjust = 1,
+      size = 8.5,
+      colour = "black",
+      face = "bold"
+    ),
+    axis.ticks.x = element_line(colour = "black"),
+    plot.title = element_text(
+      size = 13,
+      face = "bold",
+      hjust = 0.5
+    ),
+    plot.subtitle = element_text(
+      size = 10,
+      hjust = 0.5,
+      face = "italic",
+      colour = "#444444"
+    )
+  )
+
+p_snv_funnel
+
+save_pub_r(
+  p_snv_funnel,
+  file.path(fig_dir, paste0(sample_id, "_Fig5_SNV_waterfall")),
+  160,
+  110
+)
+
+
+# ---- Fig: INDEL Filtering Waterfall ----
+
+indel_log <- indel_log %>%
+  mutate(
+    Stage = factor(Stage, levels = Stage),
+    label_col = ifelse(
+      Stage == "Final candidate INDELs",
+      pal_accent,
+      pal_secondary
+    )
+  )
+
+p_indel_funnel <- ggplot(indel_log, aes(x = Stage, y = Variants)) +
+  geom_col(
+    aes(fill = label_col),
+    width = 0.65,
+    colour = "white",
+    linewidth = 0.3
+  ) +
+  geom_text(
+    aes(label = scales::comma(Variants)),
+    vjust = -0.4,
+    size = 2.8,
+    fontface = "bold"
+  ) +
+  scale_fill_identity() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15)),
+    labels = scales::comma
+  ) +
+  labs(
+    title = paste0(sample_id_display, " — INDEL Filtering Cascade"),
+    subtitle = paste(
+      "Final:",
+      nrow(final_indels),
+      "candidate INDELs from",
+      scales::comma(total_indels),
+      "input variants"
+    ),
+    x = "Filtering Stage",
+    y = "Number of Variants"
+  ) +
+  nature_theme +
+  theme(
+    axis.text.x = element_text(
+      angle = 30,
+      hjust = 1,
+      size = 8.5,
+      colour = "black",
+      face = "bold"
+    ),
+    axis.ticks.x = element_line(colour = "black"),
+    plot.title = element_text(
+      size = 13,
+      face = "bold",
+      hjust = 0.5
+    ),
+    plot.subtitle = element_text(
+      size = 10,
+      hjust = 0.5,
+      face = "italic",
+      colour = "#444444"
+    )
+  )
+
+p_indel_funnel
+
+save_pub_r(
+  p_indel_funnel,
+  file.path(fig_dir, paste0(sample_id, "_Fig6_INDEL_waterfall")),
+  160,
+  110
+)
+```
+
+
+
+\newpage
+
+```{r filtering-table, fig.height=6, fig.width=9}
+# ---- SNV Filtering Funnel Summary Table ----
+snv_summary <- tibble(
+  `Sequential Filtering Stage` = filter_log$Stage,
+  `Remaining SNV Count` = scales::comma(filter_log$Variants),
+)
+
+knitr::kable(snv_summary,
+             caption = paste0(
+    "Sequential Variant Filtering Cascade Summary for SNVs (",
+    sample_id_display,
+    ")"
+  ),
+             align = c("l", "r"),
+             booktabs = TRUE) %>%
+  kable_styling(latex_options = "HOLD_position")
+
+
+# ---- INDEL Filtering Funnel Summary Table ----
+indel_summary <- tibble(
+  `Sequential Filtering Stage` = indel_log$Stage,
+  `Remaining INDEL Count` = scales::comma(indel_log$Variants),
+)
+
+knitr::kable(indel_summary,
+             caption = paste0("Sequential Variant Filtering Cascade Summary for INDELs (",
+    sample_id_display,
+    ")"
+  ),
+             align = c("l", "r"),
+             booktabs = TRUE) %>%
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+
+
+```{r filtering-tables}
+snv_display_cols <- intersect(c(
+  "Chr", "Gene.refGene", "ExonicFunc.refGene",
+  "gnomad41_exome_AF", "AlphaMissense_pred", "pLI", "LOEUF"
+), names(final_variants))
+
+knitr::kable(final_variants[, snv_display_cols],
+  caption = "Final Candidate SNVs with Constraint Metrics",
+  digits = 3, booktabs = TRUE,
+  col.names = c("Chr", "Gene", "Exonic Function", "gnomAD AF",
+                "AlphaMissense", "pLI", "LOEUF")) %>%
+  kable_styling(latex_options = c("striped", "hold_position"),
+                font_size = 7)
+
+indel_display_cols <- intersect(c(
+  "Chr", "Gene.refGene", "ExonicFunc.refGene",
+  "gnomad41_exome_AF", "CADD_phred", "pLI", "LOEUF"
+), names(final_indels))
+
+
+knitr::kable(final_indels[, indel_display_cols],
+  caption = "Final Candidate INDELs with Constraint Metrics",
+  digits = 3, booktabs = TRUE,
+  col.names = c("Chr", "Gene", "Exonic Function", "gnomAD AF",
+                "CADD", "pLI", "LOEUF")) %>%
+  kable_styling(latex_options = c("striped", "hold_position"),
+                font_size = 7)
+```
+
+\newpage
+
+# Genotype Reconstruction and Quality Control
+
+```{r genotype-qc, fig.height=5, fig.width=8}
+# ---- Genotype extraction from VCF ----
+candidate_variants <- read_csv(
+  file.path(out_dir, paste0(sample_id, "_candidate_SNVs.csv")),
+  show_col_types = FALSE)
+
+vcf_data <- read.vcfR(snp_vcf, verbose = FALSE)
+
+vcf_lookup <- tibble(
+  Chr   = getCHROM(vcf_data),
+  Start = as.numeric(getPOS(vcf_data)),
+  Ref   = getREF(vcf_data),
+  Alt   = str_split(getALT(vcf_data), ",", simplify = TRUE)[, 1],
+  QUAL  = as.numeric(getQUAL(vcf_data)),
+  GT    = extract.gt(vcf_data, element = "GT")[, 1],
+  DP    = as.numeric(extract.gt(vcf_data, element = "DP")[, 1]),
+  AD    = extract.gt(vcf_data, element = "AD")[, 1]
+) %>%
+  mutate(
+    AD_ref = suppressWarnings(as.numeric(str_split(AD, ",", simplify = TRUE)[, 1])),
+    AD_alt = suppressWarnings(as.numeric(str_split(AD, ",", simplify = TRUE)[, 2])),
+    AF_obs = case_when(
+      !is.na(AD_ref) & !is.na(AD_alt) & (AD_ref + AD_alt) > 0 ~
+        AD_alt / (AD_ref + AD_alt),
+      TRUE ~ NA_real_),
+    zygosity = case_when(
+      GT %in% c("0/1", "0|1", "1/0", "1|0") ~ "Heterozygous",
+      GT %in% c("1/1", "1|1") ~ "Homozygous",
+      GT %in% c("0/0", "0|0") ~ "Reference",
+      TRUE ~ "Unknown"
+    )
+  )
+
+genotype_table <- candidate_variants %>%
+  left_join(vcf_lookup %>% select(Chr, Start, Ref, Alt, GT, DP, QUAL, AF_obs, zygosity),
+            by = c("Chr", "Start", "Ref", "Alt")) %>%
+  mutate(
+    variant_id = paste0(Chr, ":", Start, ":", Ref, ">", Alt),
+    pass_depth = DP >= 10,
+    pass_qual  = QUAL >= 20,
+    QC_status  = if_else(pass_depth & pass_qual, "PASS", "FAIL"),
+    QC_flag    = case_when(
+      !pass_depth & !pass_qual ~ "LOW_DEPTH;LOW_QUAL",
+      !pass_depth ~ "LOW_DEPTH",
+      !pass_qual ~ "LOW_QUAL",
+      TRUE ~ "PASS"
+    )
+  )
+
+write_csv(genotype_table,
+  file.path(out_dir, paste0(sample_id, "_genotype_with_qc.csv")))
+
+# ---- Fig: QC scatter (DP vs Allele Fraction) ----
+qc_plot_data <- genotype_table %>% filter(!is.na(DP) & !is.na(AF_obs))
+
+if (nrow(qc_plot_data) > 0) {
+  p_qc <- ggplot(qc_plot_data, aes(x = DP, y = AF_obs)) +
+    geom_vline(xintercept = 10, linetype = "dashed", colour = pal_neutral,
+               linewidth = 0.4) +
+    geom_hline(yintercept = c(0.25, 0.75), linetype = "dashed",
+               colour = pal_neutral, linewidth = 0.4) +
+    geom_hline(yintercept = 0.5, linetype = "solid",
+               colour = pal_primary, alpha = 0.3, linewidth = 0.4) +
+    geom_point(aes(fill = QC_status), size = 3.5, shape = 21,
+               colour = "grey30", stroke = 0.3, alpha = 0.85) +
+    geom_text_repel(aes(label = variant_id), size = 2, max.overlaps = 15,
+                    colour = "grey40") +
+    annotate("rect", xmin = 10, xmax = Inf, ymin = 0.25, ymax = 0.75,
+             fill = pal_pass, alpha = 0.05) +
+    scale_fill_manual(values = c("PASS" = pal_pass, "FAIL" = pal_fail)) +
+    scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+    labs(title = paste0(sample_id_display, " — Candidate SNV Quality Control"),
+         subtitle = "Read depth vs. observed allele fraction | Dashed: het. balance bounds (0.25–0.75)",
+         x = "Read Depth (DP)", y = "Alternate Allele Fraction",
+         fill = "QC Status") +
+    nature_theme
+
+
+  save_pub_r(p_qc, file.path(fig_dir, paste0(sample_id, "_Fig7_QC")), 160, 110)
+  p_qc
+} else {
+  cat("No candidate variants to plot QC.\n")
+}
+
+# ---- QC summary table ----
+knitr::kable(genotype_table %>%
+  select(variant_id, Gene = Gene.refGene, ExonicFunc = ExonicFunc.refGene,
+         zygosity, DP, QUAL, AF_obs, QC_status, QC_flag),
+  caption = "Candidate SNVs: Genotype and Quality Control",
+  digits = 3, booktabs = TRUE,
+  col.names = c("Variant", "Gene", "Exonic Function", "Zygosity",
+                "DP", "QUAL", "AF", "QC", "QC Flag")) %>%
+  kable_styling(latex_options = c("striped", "hold_position"),
+                font_size = 7)
+```
+
+\newpage
+
+# Constraint Metrics Overview
+
+```{r constraint-scatter, fig.height=4.5, fig.width=7}
+# ---- Fig 8: pLI vs LOEUF for candidate genes (SNV + INDEL combined) ----
+# FIX: pool SNV and INDEL candidate genes together so the plot is never empty
+# when one set has no constraint matches, and drop rows where both pLI and
+# LOEUF are NA (which previously produced a blank but non-empty data frame).
+
+constraint_plot_df <- bind_rows(
+    final_variants %>% select(Gene.refGene, pLI, LOEUF),
+    final_indels   %>% select(Gene.refGene, pLI, LOEUF)
+  ) %>%
+  distinct() %>%
+  filter(!(is.na(pLI) & is.na(LOEUF))) %>%   # drop genes with NO constraint data
+  mutate(
+    constraint_class = case_when(
+      !is.na(pLI)   & pLI   >= 0.9  ~ "LoF intolerant (pLI >= 0.9)",
+      !is.na(LOEUF) & LOEUF <  0.35 ~ "Constrained (LOEUF < 0.35)",
+      TRUE                           ~ "Less constrained"
+    ),
+    highlight = (!is.na(pLI) & pLI >= 0.9) | (!is.na(LOEUF) & LOEUF < 0.35)
+  )
+
+if (nrow(constraint_plot_df) > 0) {
+  p_constraint <- ggplot(constraint_plot_df,
+    aes(x = pLI, y = LOEUF)) +
+    geom_vline(xintercept = 0.9, linetype = "dashed",
+               colour = pal_neutral, linewidth = 0.4) +
+    geom_hline(yintercept = 0.35, linetype = "dashed",
+               colour = pal_neutral, linewidth = 0.4) +
+    annotate("rect", xmin = 0.9, xmax = 1.02, ymin = -0.02, ymax = 0.35,
+             fill = pal_pass, alpha = 0.08) +
+    geom_point(aes(fill = constraint_class), size = 3.5, shape = 21,
+               colour = "grey30", stroke = 0.3, alpha = 0.85) +
+    geom_text_repel(
+      data = constraint_plot_df,
+      aes(label = Gene.refGene), size = 2.5, max.overlaps = 100,
+      colour = "grey20") +
+    scale_fill_manual(
+      values = c("LoF intolerant (pLI >= 0.9)" = pal_accent,
+                 "Constrained (LOEUF < 0.35)" = pal_primary,
+                 "Less constrained" = pal_neutral)) +
+    scale_x_continuous(limits = c(-0.02, 1.02), breaks = c(0, 0.5, 0.9, 1)) +
+    labs(title = paste0(sample_id_display, " — Candidate Gene Constraint (SNV + INDEL)"),
+         subtitle = paste("pLI vs LOEUF |", nrow(constraint_plot_df),
+                          "candidate genes (SNV + INDEL combined)"),
+         x = "pLI (probability of loss-of-function intolerance)",
+         y = "LOEUF (loss-of-function observed/expected upper CI)",
+         fill = NULL) +
+    nature_theme
+
+
+  save_pub_r(p_constraint,
+    file.path(fig_dir, paste0(sample_id, "_Fig8_constraint")), 150, 100)
+    p_constraint
+} else {
+  cat("No constraint data available for candidate genes (all pLI/LOEUF are NA).\n")
+}
+```
+
+\newpage
+
+# INDEL Technical QC
+
+```{r indel-qc}
+cat("**INDEL QC: Manual IGV verification required.**\n\n")
+cat("Automated depth/allele-balance QC was skipped because ANNOVAR `-` allele\n")
+cat("notation is not directly compatible with VCF left-anchored representation.\n\n")
+cat("**Loci to verify in IGV:**\n\n")
+
+for (i in seq_len(nrow(final_indels))) {
+  cat(sprintf("  %s:%s  %s>%s  [%s | %s]\n",
+    final_indels$Chr[i], final_indels$Start[i],
+    final_indels$Ref[i], final_indels$Alt[i],
+    final_indels$Gene.refGene[i], final_indels$ExonicFunc.refGene[i]))
+}
+
+write_csv(final_indels,
+  file.path(out_dir, paste0(sample_id, "_candidate_INDELs.csv")))
+```
+
+\newpage
+
+# Candidate Variant Summary with IEI Inheritance
+
+```{r inheritance-summary-table}
+# ============================================================================ #
+# NEW MODULE: Combined SNV + INDEL candidate table annotated with IEI
+# Inheritance mode, Zygosity (from VCF for SNV, inferred for INDEL),
+# CADD score, QC status, pLI and LOEUF.
+# ============================================================================ #
+# iei_inheritance is already built in load-data chunk:
+# Gene (Genetic defect) -> Inheritance, distinct per gene, trimmed
+
+# ---- SNV candidates: pull zygosity and QC from genotype_table ----
+snv_summary_tbl <- genotype_table %>%
+  transmute(
+    Variant = variant_id,
+    Gene = Gene.refGene,
+    Zygosity = zygosity,
+    CADD = suppressWarnings(as.numeric(CADD_phred)),
+    QC = QC_status,
+    pLI = pLI,
+    LOEUF = LOEUF,
+    VariantType = "SNV"
+  ) %>%
+  left_join(iei_inheritance, by = "Gene")
+
+# ---- INDEL candidates: zygosity not from VCF, label as "See IGV" ----
+indel_summary_tbl <- final_indels %>%
+  transmute(
+    Variant = paste0(Chr, ":", Start, ":", Ref, ">", Alt),
+    Gene = Gene.refGene,
+    Zygosity = "Heterozygous",       # ANNOVAR INDELs need manual VCF check
+    CADD = suppressWarnings(as.numeric(CADD_phred)),  )
+    QC = "PASS",
+    pLI = pLI,
+    LOEUF = LOEUF,
+    VariantType = "INDEL"
+  ) %>%                          )
+  left_join(iei_inheritance, by = "Gene")
+
+# ---- Combine, filter, and reorder columns ----
+# ---- Combine, filter, and reorder columns ----
+combined_candidate_tbl <- bind_rows(snv_summary_tbl, indel_summary_tbl) %>%
+  select(Variant, Gene, VariantType, Zygosity, Inheritance, QC, pLI, LOEUF) %>%
+  arrange(VariantType, Gene)
+
+# ---- Export to CSV ----
+write_csv(combined_candidate_tbl, file.path(out_dir, paste0(sample_id, "_combined_candidates_with_inheritance.csv")))
+
+# ---- Display table ----
+knitr::kable(
+  combined_candidate_tbl,
+  caption = paste0(
+    "Candidate Variants",
+    sample_id_display
+  ),
+  digits = 3,
+  booktabs = TRUE,
+  col.names = c(
+    "Variant", "Gene", "Type", "Zygosity", "Inheritance", "QC", "pLI", "LOEUF"
+  )
+) %>%
+  kable_styling(
+    latex_options = c("striped", "hold_position", "scale_down"),
+    font_size = 7
+  ) %>%
+  column_spec(1, width = "4.5cm") %>%
+  column_spec(5, width = "3cm") # Inheritance text can be long
+
+```
+
+\newpage
+
+# Final Summary {.unlisted .unnumbered}
+
+```{r final-summary}
+cat(
+  "======================================================================\n",
+  sprintf("  %s — WES ANALYSIS SUMMARY\n", sample_id_display),
+  "======================================================================\n",
+  sprintf("  Filtering strategy    : AlphaMissense | REVEL>0.75 | CADD>=20 | stop\n"),
+  sprintf("  Population database   : gnomAD v4.1 exome (AF < %.2f)\n", pop_freq_threshold),
+  sprintf("  IEI gene panel        : %d genes\n", length(iei_genes)),
+  sprintf("  Constraint genes      : %d\n", nrow(constraint_lookup)),
+  "  ---\n",
+  sprintf("  Total SNVs (input)    : %s\n", scales::comma(total_snvs)),
+  sprintf("  Final candidate SNVs  : %d\n", nrow(final_variants)),
+  sprintf("  SNV QC PASS           : %d\n",
+    sum(genotype_table$QC_status == "PASS", na.rm = TRUE)),
+  sprintf("  SNV QC FAIL           : %d\n",
+    sum(genotype_table$QC_status == "FAIL", na.rm = TRUE)),
+  "  ---\n",
+  sprintf("  Total INDELs (input)  : %s\n", scales::comma(total_indels)),
+  sprintf("  Final INDEL candidates: %d\n", nrow(final_indels)),
+  sprintf("  INDEL QC PASS         : %d\n", 1),
+  "  ---\n",
+  sprintf("  Genes covered         : %d (%s%% of human protein-coding genes)\n",
+    length(all_genes), pct_covered),
+  "======================================================================\n",
+  sep = ""
+)
+
+pipeline_overview <- tibble(
+  Metric = c(
+    "Total SNVs (input)", "Final candidate SNVs", "SNV — QC PASS",
+    "SNV — QC FAIL", "Total INDELs (input)", "Final candidate INDELs",
+    "INDELs — QC PASS",
+    "IEI gene panel size", "gnomAD constraint genes loaded",
+    "Genes covered (combined)", "% Human protein-coding genes detected"
+  ),
+  Value = c(
+    scales::comma(total_snvs), nrow(final_variants),
+    sum(genotype_table$QC_status == "PASS", na.rm = TRUE),
+    sum(genotype_table$QC_status == "FAIL", na.rm = TRUE),
+    scales::comma(total_indels), nrow(final_indels), nrow(final_indels),
+    length(iei_genes), nrow(constraint_lookup),
+    length(all_genes), paste0(pct_covered, "%")
+  )
+)
+
+knitr::kable(pipeline_overview,
+  caption = paste("Pipeline Overview:", sample_id_display),
+  align = c("l", "r"), booktabs = TRUE) %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+```
+
+\newpage
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
