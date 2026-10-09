@@ -59,5 +59,4 @@ Submit the batch script to the SLURM scheduler:
 ```bash
 sbatch wes_pipeline.sh
 
-### 3. Visualization 
 rmarkdown::render("R_Analysis&Visualization.Rmd", params = list(sample_id = "SAMPLE_1"))
