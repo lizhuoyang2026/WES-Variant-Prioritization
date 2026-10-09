@@ -24,7 +24,7 @@ The workflow is executed via a unified Bash shell script (`wes_pipeline.sh`) div
 6. **Clinical IEI Filtering:** The heavily annotated variant list is cross-referenced against a custom, curated Inborn Errors of Immunity gene panel (`clean_iuis_panel.txt`). Variants outside this panel are filtered out, resulting in a clinically actionable candidate list.
 
 ### Phase 3: Downstream Analysis & Visualization (R/RMarkdown)
-7. **Automated Reporting (`master_report.Rmd`):** A comprehensive R script processes the annotated outputs to perform:
+7. **Automated Reporting (`R_Analysis&Visualization.Rmd`):** A comprehensive R script processes the annotated outputs to perform:
    - **Genotype Quality Control:** Evaluates read depth (DP) and allele fractions (AF) directly from the VCF.
    - **Constraint Metrics Integration:** Maps candidate genes against gnomAD constraint metrics (pLI vs LOEUF) to assess Loss-of-Function intolerance.
    - **Data Visualization:** Generates Nature-style, publication-ready composite figures (SVG/PDF/TIFF) detailing functional categories, allele frequencies, chromosome distributions, and sequential filtering waterfalls.
