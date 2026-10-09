@@ -58,5 +58,11 @@ Verify that your IEI gene panel (`clean_iuis_panel.txt`) and raw FASTQ files (`S
 Submit the batch script to the SLURM scheduler:
 ```bash
 sbatch wes_pipeline.sh
+```
 
+### 3. Generate the RMarkdown Report
+Once the bash pipeline finishes, compile the downstream analysis report by running the RMarkdown script in your local or server R environment, supplying the target sample ID:
+
+```R
 rmarkdown::render("R_Analysis&Visualization.Rmd", params = list(sample_id = "SAMPLE_1"))
+```
